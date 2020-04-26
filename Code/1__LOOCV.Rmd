@@ -1,0 +1,181 @@
+---
+title: "LOOCV in Action"
+author: "Philip D. Waggoner"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## LOOCV in linear regression
+
+In brief:
+
+1. Obtain the data 
+2. Fit a linear model to training partition (i.e. the N - 1 training set)
+3. Predict the validation data (i.e., K = N)
+4. Determine the MSE for each sample
+5. Average the MSEs to obtain estimate of test MSE
+
+We can use the `loo_cv()` function in the `rsample` library to compute the LOOCV of any linear or logistic regression model. 
+
+It takes a single argument: the *data* being cross-validated. For the `Auto` dataset again, this looks like:
+
+```{r loocv-data, dependson="Auto"}
+library(tidyverse)
+library(ISLR)
+library(broom)
+library(rsample)
+library(rcfss)
+library(yardstick)
+
+loocv_data <- loo_cv(Auto)
+loocv_data
+```
+
+Each element of `loocv_data$splits` is an object of class `rsplit`. 
+
+* This is essentially an efficient *container* for storing both the **training** (analysis) data and the **testing** data (i.e. the assessment or validation data set). If we print the contents of a single `rsplit` object:
+
+```{r rsplit, dependson = "loocv-data"}
+first_resample <- loocv_data$splits[[1]]
+first_resample
+```
+
+This tells us there are 391 observations in the training set, 1 observation in the testing set, and the original data set contain 392 observations. 
+
+To extract the analysis (training) or assessment (test) sets, use `analysis()` or `assessment()` respectively:
+
+```{r rsplit-extract}
+head(analysis(first_resample)) # or...
+head(training(first_resample)) # analysis() == training()  
+assessment(first_resample)
+```
+
+Given this new `loocv_data` data frame, we can write a function that will, for each resample:
+
+1. Obtain the analysis data set (i.e. the $N-1$ training set)
+2. Fit a linear regression model
+3. Predict the validation data (also known as the **assessment** data in this package, the $1$ validation set) using the `broom` package
+4. Calcuate the MSE for each sample
+
+```{r loocv-function, dependson = "Auto"}
+holdout_results <- function(splits) {
+  # Fit the model to the N-1
+  mod <- glm(mpg ~ horsepower, data = analysis(splits))
+  
+  # `augment` will save the predictions with the holdout data set
+  res <- augment(mod, newdata = assessment(splits)) %>%
+    # calculate the metric
+    mse(truth = mpg, estimate = .fitted)
+  
+  # Return the metrics
+  res
+}
+```
+
+This function works for a single resample:
+
+```{r loocv-function-test, dependson = "loocv-function"}
+holdout_results(loocv_data$splits[[1]])
+```
+
+To (more efficiently) calculate the MSE for each heldout observation (i.e. estimate the test MSE for *each* of the $N$ observations), we use the `map()` function from the `purrr` package to estimate the model for each training set, then calculate the MSE for each observation in each validation set:
+
+```{r loocv, dependson = c("Auto", "loocv-function")}
+loocv_data_poly1 <- loocv_data %>%
+  mutate(results = map(splits, holdout_results)) %>%
+  unnest(results) %>%
+  spread(.metric, .estimate)
+loocv_data_poly1
+```
+
+Now we can compute the overall LOOCV MSE for the data set by calculating the average of the `mse` column:
+
+```{r loocv-test-mse, dependson = c("Auto", "loocv-function")}
+loocv_data_poly1 %>%
+  summarize(mse = mean(mse))
+```
+
+We can also use this method to compare the *optimal* number of polynomial terms as before.
+
+```{r loocv_poly, dependson="Auto"}
+# modified function to estimate model with varying highest order polynomial
+holdout_results <- function(splits, i) {
+  # Fit the model to the N-1
+  mod <- glm(mpg ~ poly(horsepower, i, raw = TRUE), data = analysis(splits))
+  
+  # `augment` will save the predictions with the holdout data set
+  res <- augment(mod, newdata = assessment(splits)) %>%
+    # calculate the metric
+    mse(truth = mpg, estimate = .fitted)
+  
+  # Return the assessment data set with the additional columns
+  res
+}
+
+# function to return MSE for a specific higher-order polynomial term
+poly_mse <- function(i, loocv_data){
+  loocv_mod <- loocv_data %>%
+    mutate(results = map(splits, holdout_results, i)) %>%
+    unnest(results) %>%
+    spread(.metric, .estimate)
+  
+  mean(loocv_mod$mse)
+}
+
+cv_mse <- tibble(terms = seq(from = 1, to = 5),
+                 mse_loocv = map_dbl(terms, poly_mse, loocv_data))
+cv_mse
+
+ggplot(cv_mse, aes(terms, mse_loocv)) +
+  geom_line() +
+  labs(title = "Comparing quadratic linear models",
+       subtitle = "Using LOOCV",
+       x = "Highest-order polynomial",
+       y = "Mean Squared Error") +
+  theme_minimal()
+```
+
+And arrive at a similar conclusion as last time $\rightsquigarrow$ There may be a marginal advantage to adding a fifth-order polynomial, but perhaps not substantial enough for the additional complexity over a mere second-order polynomial.
+
+## LOOCV in classification
+
+Let's verify the error rate of our interactive terms model for the Titanic data set:
+
+```{r titanic-loocv}
+#library(titanic) # re-load if a new session
+library(titanic)
+
+titanic <- as_tibble(titanic_train) %>%
+  mutate(Survived = factor(Survived))
+
+# Now, write a function to generate assessment statistics for titanic model
+holdout_results <- function(splits) {
+  # Fit the model to the N-1
+  mod <- glm(Survived ~ Age * Sex, data = analysis(splits),
+             family = binomial)
+  
+  # `augment` will save the predictions with the holdout data set
+  res <- augment(mod, newdata = assessment(splits)) %>% 
+    as_tibble() %>%
+    mutate(.prob = logit2prob(.fitted),
+           .pred = round(.prob))
+  
+  # Return the assessment data set with the additional columns
+  res
+}
+
+titanic_loocv <- loo_cv(titanic) %>%
+  mutate(results = map(splits, holdout_results)) %>%
+  unnest(results) %>%
+  mutate(.pred = factor(.pred)) %>%
+  group_by(id) %>%
+  accuracy(truth = Survived, estimate = .pred)
+
+1 - mean(titanic_loocv$.estimate, na.rm = TRUE)
+```
+
+In a classification problem, the LOOCV tells us the average error rate, based on our predictions, is around 22%.
+
